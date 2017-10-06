@@ -108,6 +108,7 @@ class HiveSessionStateBuilder(session: SparkSession, parentState: Option[Session
           HiveTableScans,
           Scripts,
           Aggregation,
+          SpatialJoinSelection,
           JoinSelection,
           BasicOperators
         )

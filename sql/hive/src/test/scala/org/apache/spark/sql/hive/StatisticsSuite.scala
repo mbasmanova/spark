@@ -27,20 +27,122 @@ import org.apache.hadoop.hive.common.StatsSetupConst
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.TableIdentifier
 import org.apache.spark.sql.catalyst.analysis.NoSuchPartitionException
-import org.apache.spark.sql.catalyst.catalog.{CatalogStatistics, HiveTableRelation}
-import org.apache.spark.sql.catalyst.plans.logical.ColumnStat
+import org.apache.spark.sql.catalyst.catalog.{CatalogStatistics, CatalogTable, CatalogTableType, HiveTableRelation}
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression, LessThan, LessThanOrEqual, Literal}
+import org.apache.spark.sql.catalyst.plans.Inner
+import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.util.StringUtils
+import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.execution.command.DDLUtils
 import org.apache.spark.sql.execution.datasources.LogicalRelation
 import org.apache.spark.sql.execution.joins._
 import org.apache.spark.sql.hive.HiveExternalCatalog._
+import org.apache.spark.sql.hive.HiveShim.HiveFunctionWrapper
+import org.apache.spark.sql.hive.execution.HiveTableScanExec
 import org.apache.spark.sql.hive.test.TestHiveSingleton
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 
 
 class StatisticsSuite extends StatisticsCollectionTestBase with TestHiveSingleton {
-   test("Hive serde tables should fallback to HDFS for size estimation") {
+
+  test("spatial join") {
+    withTable("points") {
+      withTable("polygons") {
+        sql("CREATE TABLE points(lon DOUBLE, lat DOUBLE, name STRING)")
+        sql("CREATE TABLE polygons(city_id INT, geometry STRING)")
+
+        sql(s"CREATE TEMPORARY FUNCTION ST_Contains AS 'com.esri.hadoop.hive.ST_Contains'")
+        sql(s"CREATE TEMPORARY FUNCTION ST_GeomFromText AS 'com.esri.hadoop.hive.ST_GeomFromText'")
+        sql(s"CREATE TEMPORARY FUNCTION ST_MultiPolygon AS 'com.esri.hadoop.hive.ST_MultiPolygon'")
+        sql(s"CREATE TEMPORARY FUNCTION ST_Point AS 'com.esri.hadoop.hive.ST_Point'")
+        sql(s"CREATE TEMPORARY FUNCTION ST_Distance AS 'com.esri.hadoop.hive.ST_Distance'")
+        sql(s"CREATE TEMPORARY FUNCTION ST_Within AS 'com.esri.hadoop.hive.ST_Within'")
+
+        sql(
+          s"""
+             |INSERT INTO points
+             |VALUES
+             |  (0, 0, 'a'),
+             |  (1, 0, 'b'),
+             |  (1.4, 0, 'c'),
+             |  (10, 10, 'd')
+           """.stripMargin)
+
+        sql(
+          s"""
+             |INSERT INTO polygons
+             |VALUES
+             |  (100, 'POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))'),
+             |  (200, 'POLYGON ((1 0, 1 1, 1.5 1, 1.5 0, 1 0))')
+           """.stripMargin)
+
+        val queryPlan = sql(
+          s"""
+             |SELECT city_id --, a.*, b.geometry, a.lon + 10
+             |FROM points a, polygons b
+             |WHERE ST_Distance(ST_GeomFromText(b.geometry), ST_Point(lon, lat)) <= 0.48
+             |  --AND ST_Within(ST_GeomFromText(b.geometry), ST_Point(lon, lat))
+           """.stripMargin).queryExecution.sparkPlan
+
+        val joins = queryPlan.collect { case join: DistanceJoinExec => join }
+        assert(joins.size == 1, "Should use spatial distance join")
+
+        val join = joins(0)
+
+        Console.out.println(join)
+
+        val catalog = spark.sessionState.catalog
+        val pointsTable = catalog.getTableMetadata(new TableIdentifier("points", None))
+        val polygonsTable = catalog.getTableMetadata(new TableIdentifier("polygons", None))
+
+        def getAttributes(table: CatalogTable): Seq[AttributeReference] =
+          table.schema.fields.map { f =>
+            AttributeReference(f.name, f.dataType, f.nullable, f.metadata)()
+          }
+
+        def findAttribute(name: String, attributes: Seq[AttributeReference]): AttributeReference =
+          attributes.find(_.name == name).getOrElse(fail(s"Attribute $name not found"))
+
+        def udf(name: String, children: Seq[Expression]): HiveSimpleUDF =
+          HiveSimpleUDF(name, HiveFunctionWrapper("com.esri.hadoop.hive." + name), children)
+
+        def relation(table: CatalogTable): HiveTableRelation =
+          HiveTableRelation(table, getAttributes(table), Seq())
+
+        val pointsAttributes = getAttributes(pointsTable)
+        val polygonsAttributes = getAttributes(polygonsTable)
+
+        val cityAttribute = findAttribute("city_id", polygonsAttributes)
+        val geometryAttribute = findAttribute("geometry", polygonsAttributes)
+        val latAttribute = findAttribute("lat", pointsAttributes)
+        val lonAttribute = findAttribute("lon", pointsAttributes)
+
+        def getTableName(plan: SparkPlan): String = {
+          plan match {
+            case HiveTableScanExec(_, HiveTableRelation(table, _, _), _) => table.identifier.table
+            case _ => fail("Expected HiveTableScanExec, but got " + plan)
+          }
+        }
+
+        def getUdfName(expression: Expression): String =
+          expression match {
+            case HiveSimpleUDF(name, _, _) => name
+            case _ => fail("Expected HiveSimpleUDF, but got " + expression)
+          }
+
+        assert(getTableName(join.left) == "polygons")
+        assert(getTableName(join.right) == "points")
+        assert(getUdfName(join.leftShape) == "ST_GeomFromText")
+        assert(getUdfName(join.rightShape) == "ST_Point")
+        assert(join.radius == Literal(0.48, DoubleType))
+        assert(join.extraCondition == None)
+      }
+    }
+  }
+
+
+  test("Hive serde tables should fallback to HDFS for size estimation") {
     withSQLConf(SQLConf.ENABLE_FALL_BACK_TO_HDFS_FOR_STATS.key -> "true") {
       withTable("csv_table") {
         withTempDir { tempDir =>
